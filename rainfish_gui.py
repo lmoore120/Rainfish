@@ -1,21 +1,24 @@
 r"""
-fishcolour_gui.py - the whole pipeline in one window.
+rainfish_gui.py - Rainfish: the whole pipeline in one window.
 
 Run this and everything else follows from it: choose your videos, set the
 options, and work down the steps. Nothing has to be run in the right order
 by hand, and each step is checked before the next one unlocks.
 
-    python fishcolour_gui.py
+    python rainfish_gui.py
 
 WHAT IT DOES
-  Settings      your rig: scale bar, colour card, landmark scheme, sampling
+  Settings      your rig: scale bar, sampling, analysis
   1 Videos      choose a folder of videos (or pick individual files)
-  2 Extract     pull sharp frames, with video date, resolution and codec
+  2 Extract     pull sharp frames, with video date, resolution and codec,
+                plus (optionally) one extra frame at a time you choose
   3 Review      look over the frames, drop or replace bad ones
-  4 Landmark    place the 43 landmarks on each frame
-  5 Checks      facing, landmark quality, colour standard, scale
-  6 Colour      Colormesh warping and sampling, then CIE L*a*b*
-  7 Results     rates, capacity, graphs, and colour maps per fish
+  4 Landmark    place the landmarks on each frame for the chosen animal
+                (the fish preset, or one made with "Create your own..."),
+                plus whichever of label / color standard / scale bar you've ticked
+  5 Checks      facing, landmark quality, color standard, scale
+  6 Color       Colormesh warping and sampling, then CIE L*a*b*
+  7 Results     rates, capacity, graphs, and color maps per video
 
 HOW IT IS PUT TOGETHER
   Each step runs the existing command-line script as a separate process and
@@ -49,6 +52,9 @@ from tkinter import filedialog, messagebox, ttk
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
+SETTINGS_FILE = "rainfish.json"
+OLD_SETTINGS_FILE = "fishcolour.json"     # read if a project predates the rename
+
 try:
     import fishcolour_config as config_module
 except ImportError:
@@ -62,7 +68,8 @@ except ImportError:
 PYTHON_STEPS = {
     "extract": "extract_frames.py",
     "review": "review_frames.py",
-    "landmark": "find_fish_and_landmarks.py",
+    "landmark": "find_animal_landmarks.py",
+    "profile_maker": "make_animal_profile.py",
     "colormaps": "render_colormaps.py",
     "sheets": "frame_sheets.py",
 }
@@ -76,6 +83,76 @@ R_STEPS = {
 
 def script_path(name):
     return os.path.join(HERE, name)
+
+
+# =====================================================================
+# Animal profiles (landmark schemes)
+# =====================================================================
+
+PROFILE_DIR = os.path.join(HERE, "profiles")
+FISH_PROFILE = "killifish.json"
+CREATE_OWN = "Create your own..."
+
+# Used only if profiles\killifish.json has gone missing, so the fish
+# scheme still works (without its default shape).
+BUILT_IN_FISH = {
+    "name": "Fish (killifish, 43 landmarks)",
+    "fixed_names": ["anterior", "anterior_dorsal_fin", "posterior_dorsal_fin",
+                    "dorsal_caudal_fin", "ventral_caudal_fin", "posterior_anal_fin",
+                    "anterior_anal_fin"],
+    "semis_per_segment": [9, 1, 2, 9, 1, 3, 11],
+    "facing": {"front": [1], "back": [4, 5]},
+}
+
+
+def read_profile(filename):
+    """A profile from the profiles folder, or None if missing or unreadable."""
+    try:
+        with open(os.path.join(PROFILE_DIR, filename), encoding="utf-8") as handle:
+            profile = json.load(handle)
+        names, semis = profile["fixed_names"], profile["semis_per_segment"]
+        if len(names) < 3 or len(semis) != len(names):
+            return None
+        return profile
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def load_profile(filename):
+    """The chosen profile, falling back to the fish scheme."""
+    return (read_profile(filename or FISH_PROFILE) or read_profile(FISH_PROFILE)
+            or dict(BUILT_IN_FISH))
+
+
+def list_profiles():
+    """[(name shown in the dropdown, file name)], fish first."""
+    found = [(load_profile(FISH_PROFILE)["name"], FISH_PROFILE)]
+    if os.path.isdir(PROFILE_DIR):
+        for name in sorted(os.listdir(PROFILE_DIR)):
+            if name.lower().endswith(".json") and name != FISH_PROFILE:
+                profile = read_profile(name)
+                if profile is not None:
+                    found.append((profile.get("name", name), name))
+    return found
+
+
+def profile_counts(profile):
+    n_fixed = len(profile["fixed_names"])
+    return n_fixed, sum(profile["semis_per_segment"]), \
+        n_fixed + sum(profile["semis_per_segment"])
+
+
+def perimeter_order(profile):
+    """1-based landmark numbers walking round the outline (R's perimeter.map)."""
+    n_fixed = len(profile["fixed_names"])
+    order, number = [1], n_fixed + 1
+    for segment, how_many in enumerate(profile["semis_per_segment"]):
+        order += list(range(number, number + how_many))
+        number += how_many
+        end = (segment + 1) % n_fixed
+        if end:
+            order.append(end + 1)
+    return order
 
 
 def find_rscript():
@@ -238,7 +315,8 @@ class ProjectChecks:
         videos = {r.get("video", "") for r in rows}
         return {"folder": folder, "manifest": manifest, "rows": len(rows),
                 "on_disk": on_disk, "videos": len(videos),
-                "capacity_column": bool(rows) and "capacity_frame" in rows[0]}
+                "capacity_column": bool(rows) and "capacity_frame" in rows[0],
+                "extra_frames": sum(1 for r in rows if str(r.get("capacity_frame")) == "1")}
 
     def landmarks_state(self):
         folder = self.path("landmarks")
@@ -271,16 +349,20 @@ class ProjectChecks:
                 "by_video": by_video if os.path.exists(by_video) else None,
                 "rows": len(read_csv_rows(by_video))}
 
-    def facing_report(self):
-        """Which way each fish faces, read from the landmark files.
+    def facing_report(self, profile=None):
+        """Which way each animal faces, read from the landmark files.
 
         Mixed facing is the one thing that must be known BEFORE Colormesh
-        runs: averaging a fish with its own mirror image collapses the
-        reference shape and scrambles every colour measurement. Colormesh
+        runs: averaging an animal with its own mirror image collapses the
+        reference shape and scrambles every color measurement. Colormesh
         corrects this itself, but it is worth seeing the numbers."""
         folder = os.path.join(self.path("landmarks"), "Landmarks")
         if not os.path.isdir(folder):
             return None
+        facing = (profile or BUILT_IN_FISH).get("facing") or {"front": [1], "back": [4, 5]}
+        front = [i - 1 for i in facing["front"]]
+        back = [i - 1 for i in facing["back"]]
+        needed = max(front + back) + 1
         right = left = unreadable = 0
         for name in os.listdir(folder):
             if not name.upper().endswith(".TPS"):
@@ -297,12 +379,12 @@ class ProjectChecks:
             except Exception:                           # noqa: BLE001
                 unreadable += 1
                 continue
-            if len(points) < 5:
+            if len(points) < needed:
                 unreadable += 1
                 continue
-            snout = points[0][0]
-            tail = (points[3][0] + points[4][0]) / 2
-            if snout > tail:
+            head = sum(points[i][0] for i in front) / len(front)
+            tail = sum(points[i][0] for i in back) / len(back)
+            if head > tail:
                 right += 1
             else:
                 left += 1
@@ -318,7 +400,7 @@ def forward(path):
     return os.path.abspath(path).replace("\\", "/")
 
 
-def write_configured_r(project, settings, generated_folder):
+def write_configured_r(project, settings, generated_folder, profile=None):
     """Copy each R script with its paths and settings filled in.
 
     Every substitution is checked: if a line this expects is not found, it
@@ -334,9 +416,10 @@ def write_configured_r(project, settings, generated_folder):
             return
         with open(source, encoding="utf-8") as handle:
             text = handle.read()
-        for pattern, replacement in replacements:
+        for pattern, replacement, *extra_flags in replacements:
             new_text, count = re.subn(pattern, replacement.replace("\\", "\\\\"),
-                                      text, count=1, flags=re.M)
+                                      text, count=1,
+                                      flags=re.M | (extra_flags[0] if extra_flags else 0))
             if count == 0:
                 problems.append(f"{name}: could not find the line matching "
                                 f"{pattern!r} to set. The script may have been edited.")
@@ -354,7 +437,22 @@ def write_configured_r(project, settings, generated_folder):
     manifest = forward(os.path.join(project, "frames", "frames_manifest.csv"))
     patches = forward(os.path.join(project, "RGB_calib_val.csv"))
 
+    # The landmark layout, from the animal profile: the order the points run
+    # round the outline, which ones are the primary landmarks, and which
+    # ones say which way the animal faces.
+    profile = profile or BUILT_IN_FISH
+    n_fixed = len(profile["fixed_names"])
+    perimeter = ", ".join(str(n) for n in perimeter_order(profile))
+    facing = profile.get("facing") or {"front": [1], "back": [4, 5]}
+    front = ", ".join(str(i) for i in facing["front"])
+    back = ", ".join(str(i) for i in facing["back"])
+
     configure(R_STEPS["colormesh"], [
+        (r'^perimeter\.map\s*<-\s*c\([^)]*\)[ \t]*$', f'perimeter.map <- c({perimeter})', re.S),
+        (r'^sliders1\s*<-.*$', f'sliders1 <- make.sliders(perimeter.map, main.lms = 1:{n_fixed})'),
+        (r'^facing_right\s*<-.*$',
+         f'facing_right <- apply(specimen.LM, 3, function(lm) '
+         f'mean(lm[c({front}), 1]) > mean(lm[c({back}), 1]))'),
         (r'^image_dir\s*<-.*$', f'image_dir <- "{frames}"'),
         (r'^landmark_dir\s*<-.*$', f'landmark_dir <- "{landmarks}/Landmarks/"'),
         (r'^calib_dir\s*<-.*$', f'calib_dir <- "{landmarks}/Landmarks_calib/"'),
@@ -382,7 +480,7 @@ def write_configured_r(project, settings, generated_folder):
 
 
 def write_patch_values(project, reference_rgb, names):
-    """RGB_calib_val.csv, the known colours of the card, for Colormesh."""
+    """RGB_calib_val.csv, the known colors of the card, for Colormesh."""
     import csv
     path = os.path.join(project, "RGB_calib_val.csv")
     with open(path, "w", newline="", encoding="utf-8") as handle:
@@ -402,7 +500,7 @@ def write_patch_values(project, reference_rgb, names):
 class Application(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Fish colour change - pipeline")
+        self.title("Rainfish")
         self.geometry("1100x800")
         self.minsize(900, 650)
 
@@ -412,6 +510,20 @@ class Application(tk.Tk):
         self.current_step = None
         self._after_step = None
         self.settings_widgets = {}
+        # Which extras landmarking should insist on for every frame. The
+        # landmarks themselves are always required.
+        self.landmark_requires = {
+            "label": tk.BooleanVar(value=True),
+            "color_standard": tk.BooleanVar(value=True),
+            "scale": tk.BooleanVar(value=True),
+        }
+        # The animal's landmark scheme. Anything other than a saved profile
+        # (including nothing chosen) means the fish preset.
+        self.profile_file = FISH_PROFILE
+        self.profile_choice = tk.StringVar(value="")
+        # One optional extra frame at a set time (e.g. the end of a trial).
+        self.extra_frame = tk.BooleanVar(value=False)
+        self.extra_frame_seconds = tk.StringVar(value="300")
 
         self._build()
         self.after(120, self._pump)
@@ -459,7 +571,7 @@ class Application(tk.Tk):
         self.notebook.add(tab, text="Settings")
 
         ttk.Label(tab, text="These describe your equipment and your animal. "
-                            "They are saved in the project as fishcolour.yaml.",
+                            f"They are saved in the project as {SETTINGS_FILE}.",
                   wraplength=900).grid(row=0, column=0, columnspan=4, sticky="w",
                                        pady=(0, 10))
 
@@ -469,13 +581,9 @@ class Application(tk.Tk):
              "evenly spaced across the window below"),
             ("Window (seconds)", "window_seconds", "120",
              "the stretch those frames are spread across"),
-            ("Capacity frame at (seconds)", "capacity_frame_seconds", "300",
-             "one extra frame at the end of the trial; 0 for none"),
             ("Equipment", None, None, None),
             ("Scale bar length (mm)", "scale_bar_mm", "11.5",
              "the real length of the scale bar in shot"),
-            ("Colour patch width (mm)", "colour_standard_square_mm", "11.5",
-             "the real width of one printed square on the card"),
             ("Background", "background", "white",
              "white or black - used to name the output files"),
             ("Analysis", None, None, None),
@@ -526,24 +634,26 @@ class Application(tk.Tk):
              "Pull sharp frames, with each video's date, size and length",
              self.step_extract, "Run"),
             ("review", "3. Review frames",
-             "Look over every fish's frames; drop or replace bad ones",
+             "Look over each video's frames; drop or replace bad ones",
              self.step_review, "Open"),
             ("landmark", "4. Landmarking",
-             "Place the 43 landmarks, type the fish ID, check the colour card",
+             "Place the landmarks for the animal chosen below, plus the ticked extras",
              self.step_landmark, "Open"),
             ("checks", "5. Checks",
-             "Facing, landmark quality, colour standard, scale",
+             "Facing, landmark quality, color standard, scale",
              self.step_checks, "Check"),
-            ("colour", "6. Extract colour",
+            ("colour", "6. Extract color",
              "Colormesh warping and sampling, then CIE L*a*b*",
              self.step_colour, "Run"),
             ("results", "7. Results",
-             "Rates, capacity, graphs and colour maps",
+             "Rates, capacity, graphs and color maps",
              self.step_results, "Run"),
         ]
-        for index, (key, title, description, command, verb) in enumerate(steps):
+        grid_row = 0
+        for key, title, description, command, verb in steps:
             frame = ttk.Frame(tab, padding=(0, 6))
-            frame.grid(row=index, column=0, sticky="ew")
+            frame.grid(row=grid_row, column=0, sticky="ew")
+            grid_row += 1
             tab.columnconfigure(0, weight=1)
             frame.columnconfigure(1, weight=1)
 
@@ -560,14 +670,132 @@ class Application(tk.Tk):
             detail.grid(row=2, column=1, columnspan=2, sticky="w")
             self.step_rows[key] = {"state": state, "button": button, "detail": detail}
 
-        ttk.Separator(tab, orient="horizontal").grid(row=len(steps), column=0,
+            if key == "extract":
+                options = ttk.Frame(tab, padding=(36, 0, 0, 4))
+                options.grid(row=grid_row, column=0, sticky="w")
+                grid_row += 1
+                ttk.Checkbutton(options, text="Also take one extra frame at",
+                                variable=self.extra_frame,
+                                command=self._extra_frame_toggled).pack(side="left")
+                self.extra_frame_entry = ttk.Entry(
+                    options, textvariable=self.extra_frame_seconds, width=7)
+                self.extra_frame_entry.pack(side="left", padx=4)
+                ttk.Label(options, text="seconds  (outside the even series - e.g. the "
+                                        "end of a trial, for capacity)",
+                          foreground="#666").pack(side="left")
+                self._extra_frame_toggled()
+
+            if key == "landmark":
+                animal_row = ttk.Frame(tab, padding=(36, 0, 0, 2))
+                animal_row.grid(row=grid_row, column=0, sticky="w")
+                grid_row += 1
+                ttk.Label(animal_row, text="Animal:",
+                          foreground="#666").pack(side="left", padx=(0, 8))
+                self.profile_box = ttk.Combobox(animal_row, textvariable=self.profile_choice,
+                                                state="readonly", width=42)
+                self.profile_box.pack(side="left")
+                self.profile_box.bind("<<ComboboxSelected>>", self._profile_selected)
+                self.profile_summary = ttk.Label(animal_row, text="", foreground="#666")
+                self.profile_summary.pack(side="left", padx=8)
+                self._fill_profile_box()
+
+                options = ttk.Frame(tab, padding=(36, 0, 0, 4))
+                options.grid(row=grid_row, column=0, sticky="w")
+                grid_row += 1
+                ttk.Label(options, text="Required on every frame:",
+                          foreground="#666").pack(side="left", padx=(0, 8))
+                for option_key, option_label in (("label", "Label / ID"),
+                                                 ("color_standard", "Color standard"),
+                                                 ("scale", "Scale bar")):
+                    ttk.Checkbutton(options, text=option_label,
+                                    variable=self.landmark_requires[option_key],
+                                    command=self.refresh_steps).pack(side="left",
+                                                                     padx=(0, 10))
+
+        ttk.Separator(tab, orient="horizontal").grid(row=grid_row, column=0,
                                                      sticky="ew", pady=10)
         bottom = ttk.Frame(tab)
-        bottom.grid(row=len(steps) + 1, column=0, sticky="w")
+        bottom.grid(row=grid_row + 1, column=0, sticky="w")
         ttk.Button(bottom, text="Refresh all",
                    command=self.refresh_steps).pack(side="left")
         ttk.Button(bottom, text="Open project folder",
                    command=self.open_project_folder).pack(side="left", padx=6)
+
+    # ---------------------------------------------- animal and extra frame
+    def _extra_frame_toggled(self):
+        self.extra_frame_entry.configure(
+            state="normal" if self.extra_frame.get() else "disabled")
+
+    def current_profile(self):
+        return load_profile(self.profile_file)
+
+    def _fill_profile_box(self):
+        """Fill the Animal dropdown: the fish preset, any saved profiles, and
+        'Create your own...'. Shows whichever profile is current."""
+        self._profiles = list_profiles()
+        files = [f for _, f in self._profiles]
+        if self.profile_file not in files:
+            self.profile_file = FISH_PROFILE       # unknown or deleted -> fish
+        self.profile_box["values"] = [name for name, _ in self._profiles] + [CREATE_OWN]
+        shown = dict((f, n) for n, f in self._profiles)[self.profile_file]
+        self.profile_choice.set(shown)
+        n_fixed, n_semi, total = profile_counts(self.current_profile())
+        self.profile_summary.configure(
+            text=f"{n_fixed} primary + {n_semi} semilandmarks = {total}")
+
+    def _profile_selected(self, _event=None):
+        choice = self.profile_choice.get()
+        if choice == CREATE_OWN:
+            self._fill_profile_box()               # show the current one until saved
+            self._create_profile()
+            return
+        for name, filename in self._profiles:
+            if name == choice:
+                self.profile_file = filename
+                break
+        else:
+            self.profile_file = FISH_PROFILE
+        self._fill_profile_box()
+        self.append_log(f"Animal: {self.profile_choice.get()}\n")
+        if self.project.get() and os.path.isdir(self.project.get()):
+            self.save_settings()
+
+    def _create_profile(self):
+        """Open the shape maker. When it saves, the new profile is selected."""
+        maker = script_path(PYTHON_STEPS["profile_maker"])
+        if self.runner.running:
+            messagebox.showinfo("Busy", "Something is already running. Wait for it "
+                                        "to finish, or press Stop.")
+            return
+        if not os.path.exists(maker):
+            messagebox.showerror("Missing", f"{PYTHON_STEPS['profile_maker']} is not in {HERE}.")
+            return
+        started = time.time()
+        self.append_log("The profile maker is opening: choose a frame, name your primary "
+                        "landmarks and how many semilandmarks go between them, click "
+                        "the primary landmarks, fill in, drag points onto the edge, "
+                        "and save.\n", "note")
+
+        def pick_new():
+            newest = None
+            if os.path.isdir(PROFILE_DIR):
+                for name in os.listdir(PROFILE_DIR):
+                    path = os.path.join(PROFILE_DIR, name)
+                    if name.lower().endswith(".json") and os.path.getmtime(path) >= started - 1:
+                        if newest is None or os.path.getmtime(path) > os.path.getmtime(
+                                os.path.join(PROFILE_DIR, newest)):
+                            newest = name
+            if newest and read_profile(newest):
+                self.profile_file = newest
+                self._fill_profile_box()
+                self.append_log(f"Animal: {self.profile_choice.get()} - now selected.\n",
+                                "good")
+                if self.project.get() and os.path.isdir(self.project.get()):
+                    self.save_settings()
+
+        self._after_step = pick_new
+        self.run_step("Creating an animal profile",
+                      [sys.executable, maker, "--out", PROFILE_DIR])
 
     # ------------------------------------------------------- utilities
     def append_log(self, text, tag=None):
@@ -596,7 +824,7 @@ class Application(tk.Tk):
             self.status.configure(text=f"{self.current_step}: did not finish.")
             # A later stage must not run on the back of a failed one: the
             # CIE conversion on a half-finished Colormesh run would quietly
-            # produce colours for only some of the fish.
+            # produce colors for only some of the animals.
             follow_on = None
         self.current_step = None
         self.refresh_steps()
@@ -690,6 +918,10 @@ class Application(tk.Tk):
                 out[key] = value
         return out
 
+    def requires(self, item):
+        """Whether landmarking should insist on this extra for every frame."""
+        return bool(self.landmark_requires[item].get())
+
     def save_settings(self):
         if not self.require_project():
             return
@@ -698,20 +930,22 @@ class Application(tk.Tk):
             "sampling": {
                 "frames_per_video": int(values.get("frames_per_video", 10)),
                 "window_seconds": float(values.get("window_seconds", 120)),
-                "capacity_frame_seconds": float(values.get("capacity_frame_seconds", 300)),
+                "extra_frame": bool(self.extra_frame.get()),
+                "extra_frame_seconds": self.extra_frame_time() or 300.0,
             },
+            "animal_profile": self.profile_file,
             "scale": {
                 "scale_bar_mm": float(values.get("scale_bar_mm", 11.5)),
-                "colour_standard_square_mm":
-                    float(values.get("colour_standard_square_mm", 11.5)),
             },
             "analysis": {
                 "num_passes": int(values.get("num_passes", 7)),
                 "z_inf_end_frames": int(values.get("z_inf_end_frames", 2)),
             },
             "background": values.get("background", "white"),
+            "landmarking_requires": {key: bool(variable.get()) for key, variable
+                                     in self.landmark_requires.items()},
         }
-        path = os.path.join(self.project.get(), "fishcolour.json")
+        path = os.path.join(self.project.get(), SETTINGS_FILE)
         with open(path, "w", encoding="utf-8") as handle:
             json.dump(config, handle, indent=2)
 
@@ -722,7 +956,10 @@ class Application(tk.Tk):
         self.append_log(f"Settings saved to {path}\n", "good")
 
     def load_settings(self):
-        path = os.path.join(self.project.get(), "fishcolour.json")
+        path = os.path.join(self.project.get(), SETTINGS_FILE)
+        if not os.path.exists(path):
+            # Projects made before the rename kept their settings here.
+            path = os.path.join(self.project.get(), OLD_SETTINGS_FILE)
         if not os.path.exists(path):
             return
         with open(path, encoding="utf-8") as handle:
@@ -737,7 +974,37 @@ class Application(tk.Tk):
                 value = flat[key]
                 variable.set(str(int(value)) if isinstance(value, float)
                              and value.is_integer() else str(value))
-        self.append_log(f"Settings loaded from {path}\n")
+        for key, value in config.get("landmarking_requires", {}).items():
+            if key in self.landmark_requires:
+                self.landmark_requires[key].set(bool(value))
+
+        sampling = config.get("sampling", {})
+        if "extra_frame" in sampling:
+            self.extra_frame.set(bool(sampling["extra_frame"]))
+            seconds = float(sampling.get("extra_frame_seconds", 300))
+        else:
+            # Older projects always took a capacity frame (0 meant none).
+            seconds = float(sampling.get("capacity_frame_seconds", 0) or 0)
+            self.extra_frame.set(seconds > 0)
+            seconds = seconds or 300.0
+        self.extra_frame_seconds.set(str(int(seconds)) if seconds.is_integer()
+                                     else str(seconds))
+        self._extra_frame_toggled()
+
+        self.profile_file = config.get("animal_profile") or FISH_PROFILE
+        self._fill_profile_box()
+        self.append_log(f"Settings loaded from {path}  (animal: "
+                        f"{self.profile_choice.get()})\n")
+
+    def extra_frame_time(self):
+        """Seconds for the optional extra frame, or None if not wanted/invalid."""
+        if not self.extra_frame.get():
+            return None
+        try:
+            seconds = float(self.extra_frame_seconds.get())
+        except ValueError:
+            return None
+        return seconds if seconds > 0 else None
 
     # ---------------------------------------------------------- steps
     def mark(self, key, symbol, detail="", colour="#444"):
@@ -760,8 +1027,9 @@ class Application(tk.Tk):
 
         frames = checks.frames_state()
         if frames["rows"]:
-            note = (f"{frames['rows']} frames from {frames['videos']} video(s)"
-                    f"{'' if frames['capacity_column'] else '  (no capacity frame)'}")
+            note = f"{frames['rows']} frames from {frames['videos']} video(s)"
+            if frames["extra_frames"]:
+                note += f" (incl. {frames['extra_frames']} extra frame(s))"
             if frames["on_disk"] < frames["rows"]:
                 note += f"  - WARNING: only {frames['on_disk']} image files on disk"
             self.mark("extract", "\u2714", note, "#2a7")
@@ -783,8 +1051,8 @@ class Application(tk.Tk):
             note = (f"{marks['tps']} landmarked, {marks['skipped']} skipped, "
                     f"of {frames['rows']} frames")
             warnings = []
-            if marks["no_card"]:
-                warnings.append(f"{marks['no_card']} without a colour standard")
+            if marks["no_card"] and self.requires("color_standard"):
+                warnings.append(f"{marks['no_card']} without a color standard")
             if marks["crossing"]:
                 warnings.append(f"{marks['crossing']} with a crossed outline")
             if warnings:
@@ -798,7 +1066,7 @@ class Application(tk.Tk):
         colour = checks.colour_state()
         if colour["lab"]:
             self.mark("colour", "\u2714",
-                      f"colour extracted ({colour['per_frame']} frames measured)", "#2a7")
+                      f"color extracted ({colour['per_frame']} frames measured)", "#2a7")
         elif colour["per_frame"]:
             self.mark("colour", "\u25d0",
                       f"{colour['per_frame']} frames measured so far", "#a60")
@@ -807,7 +1075,7 @@ class Application(tk.Tk):
 
         results = checks.results_state()
         self.mark("results", "\u2714" if results["by_video"] else "\u25cb",
-                  f"{results['rows']} fish in the results" if results["by_video"]
+                  f"{results['rows']} video(s) in the results" if results["by_video"]
                   else "not run yet", "#2a7" if results["by_video"] else "#444")
 
     def step_videos(self):
@@ -851,8 +1119,14 @@ class Application(tk.Tk):
                    "--out", os.path.join(project, "frames"),
                    "--frames", str(int(values.get("frames_per_video", 10))),
                    "--seconds", str(float(values.get("window_seconds", 120)))]
-        if "capacity_frame_seconds" in values:
-            command += ["--capacity-at", str(float(values["capacity_frame_seconds"]))]
+        extra = self.extra_frame_time()
+        if self.extra_frame.get() and extra is None:
+            messagebox.showwarning("Extra frame time",
+                                   "Type the time for the extra frame in seconds "
+                                   "(a number above 0), or untick the box.")
+            return
+        # 0 tells extract_frames.py not to take the extra frame at all.
+        command += ["--capacity-at", str(extra if extra else 0)]
         self.run_step("Extracting frames", command)
 
     def step_review(self):
@@ -862,7 +1136,7 @@ class Application(tk.Tk):
         if not ProjectChecks(project).frames_state()["rows"]:
             messagebox.showwarning("No frames", "Extract frames first (step 2).")
             return
-        self.append_log("The review window is opening. Y keeps a fish, N rejects it, "
+        self.append_log("The review window is opening. Y keeps a video, N rejects it, "
                         "Q saves and closes. It can be closed and reopened at any "
                         "time.\n", "note")
         self.run_step("Reviewing frames",
@@ -877,14 +1151,52 @@ class Application(tk.Tk):
         if not ProjectChecks(project).frames_state()["rows"]:
             messagebox.showwarning("No frames", "Extract frames first (step 2).")
             return
-        self.append_log("The landmarking window is opening. Press T to type the fish "
-                        "ID, click the 7 points, SPACE to fill in the rest, ENTER for "
-                        "the next frame, Q to save and close. It picks up where you "
-                        "left off.\n", "note")
-        self.run_step("Landmarking",
-                      [sys.executable, script_path(PYTHON_STEPS["landmark"]),
-                       os.path.join(project, "frames"),
-                       "--out", os.path.join(project, "landmarks")])
+        profile = self.current_profile()
+        n_fixed, _, total = profile_counts(profile)
+
+        # Landmarks already saved with a different scheme can't be mixed
+        # with these: the CSV columns and the TPS files would disagree.
+        existing = os.path.join(project, "landmarks", "landmarks.csv")
+        if os.path.exists(existing):
+            with open(existing, newline="", encoding="utf-8-sig") as handle:
+                header = handle.readline()
+            saved = len(re.findall(r"\blm\d+_x\b", header))
+            if saved and saved != total and not messagebox.askyesno(
+                    "Different landmark scheme",
+                    f"This project's landmarks were saved with {saved} landmarks, but "
+                    f"the animal chosen ({profile['name']}) has {total}.\n\nThe two "
+                    f"can't be mixed. Usually you'd pick the animal they were made "
+                    f"with, or start a new project for this one. Carry on anyway?"):
+                return
+
+        self.save_settings()
+        wanted = [name for key, name in (("label", "label / ID"),
+                                         ("color_standard", "color standard"),
+                                         ("scale", "scale bar"))
+                  if self.requires(key)]
+        has_shape = bool(profile.get("template"))
+        self.append_log("The landmarking window is opening. "
+                        + ("Press T to type the ID, " if self.requires("label") else "")
+                        + f"click the {n_fixed} primary points"
+                        + (" (or G for the default shape)" if has_shape else "")
+                        + ", SPACE to fill in the rest, ENTER for the next frame, Q to "
+                          "save and close. It picks up where you left off.\n"
+                        + f"Animal: {profile['name']}. Required on every frame: "
+                          f"{total} landmarks"
+                        + ("".join(", " + w for w in wanted)) + ".\n", "note")
+        command = [sys.executable, script_path(PYTHON_STEPS["landmark"]),
+                   os.path.join(project, "frames"),
+                   "--out", os.path.join(project, "landmarks"),
+                   "--profile", os.path.join(PROFILE_DIR, self.profile_file)]
+        if not os.path.exists(command[-1]):
+            command = command[:-2]      # profile file gone: the script's built-in fish
+        if not self.requires("label"):
+            command.append("--no-label")
+        if not self.requires("color_standard"):
+            command.append("--no-color-standard")
+        if not self.requires("scale"):
+            command.append("--no-scale")
+        self.run_step("Landmarking", command)
 
     def step_checks(self):
         if not self.require_project():
@@ -901,24 +1213,28 @@ class Application(tk.Tk):
         line(frames["rows"] > 0, f"{frames['rows']} frames recorded in the manifest")
         line(frames["on_disk"] >= frames["rows"],
              f"{frames['on_disk']} image files on disk")
-        line(frames["capacity_column"],
-             "capacity frame recorded" if frames["capacity_column"]
-             else "no capacity_frame column - frames came from an older version")
+        if self.extra_frame.get():
+            line(frames["extra_frames"] > 0,
+                 f"extra frame taken for {frames['extra_frames']} video(s)"
+                 if frames["extra_frames"]
+                 else "the extra frame is ticked, but none was taken - re-run step 2, "
+                      "or check the videos are long enough")
         line(marks["tps"] > 0, f"{marks['tps']} frames landmarked "
                                f"({marks['skipped']} skipped as unusable)")
-        line(marks["calib"] == marks["tps"],
-             f"{marks['calib']} colour-standard files (should equal the landmark count)")
-        line(marks["no_card"] == 0,
-             f"{marks['no_card']} landmarked frame(s) have no colour standard"
-             if marks["no_card"] else "every landmarked frame has a colour standard")
+        if self.requires("color_standard"):
+            line(marks["calib"] == marks["tps"],
+                 f"{marks['calib']} color-standard files (should equal the landmark count)")
+            line(marks["no_card"] == 0,
+                 f"{marks['no_card']} landmarked frame(s) have no color standard"
+                 if marks["no_card"] else "every landmarked frame has a color standard")
         line(marks["crossing"] == 0,
              f"{marks['crossing']} outline(s) cross themselves - points out of order"
              if marks["crossing"] else "no crossed outlines")
-        if marks["no_id"]:
-            self.append_log(f"  note  {marks['no_id']} frame(s) have no fish ID yet "
+        if marks["no_id"] and self.requires("label"):
+            self.append_log(f"  note  {marks['no_id']} frame(s) have no ID yet "
                             f"(press T while landmarking)\n", "note")
 
-        facing = checks.facing_report()
+        facing = checks.facing_report(self.current_profile())
         if facing:
             total = facing["right"] + facing["left"]
             self.append_log(f"\n  Facing: {facing['right']} right, {facing['left']} left"
@@ -926,7 +1242,7 @@ class Application(tk.Tk):
             if facing["right"] and facing["left"]:
                 self.append_log("  Both directions are present. Colormesh mirrors the "
                                 "minority before building the reference shape, which "
-                                "it must: averaging a fish with its mirror image "
+                                "it must: averaging an animal with its mirror image "
                                 "collapses that shape. Watch for the 'Mirroring N "
                                 "frame(s)' line in step 6.\n", "note")
             if facing["unreadable"]:
@@ -951,8 +1267,8 @@ class Application(tk.Tk):
             return
         if marks["no_card"]:
             if not messagebox.askyesno(
-                    "Frames without a colour standard",
-                    f"{marks['no_card']} landmarked frame(s) have no colour standard, "
+                    "Frames without a color standard",
+                    f"{marks['no_card']} landmarked frame(s) have no color standard, "
                     f"so they cannot be calibrated and will fail in Colormesh.\n\n"
                     f"Carry on anyway?"):
                 return
@@ -960,7 +1276,8 @@ class Application(tk.Tk):
         self.save_settings()
         values = self.settings_dict()
         generated = os.path.join(project, "_generated")
-        written, problems = write_configured_r(project, values, generated)
+        written, problems = write_configured_r(project, values, generated,
+                                               self.current_profile())
         for problem in problems:
             self.append_log("  " + problem + "\n", "bad")
         if problems:
@@ -981,7 +1298,7 @@ class Application(tk.Tk):
         stages = [("Colormesh (warping and sampling)", R_STEPS["colormesh"]),
                   ("CIE L*a*b* conversion", R_STEPS["cie"])]
         if self._colour_stage >= len(stages):
-            self.append_log("\nColour extraction finished. Step 7 next.\n", "good")
+            self.append_log("\nColor extraction finished. Step 7 next.\n", "good")
             self.refresh_steps()
             return
         label, script = stages[self._colour_stage]
@@ -999,13 +1316,14 @@ class Application(tk.Tk):
         project = self.project.get()
         colour = ProjectChecks(project).colour_state()
         if not colour["lab"]:
-            messagebox.showwarning("No colour data",
+            messagebox.showwarning("No color data",
                                    "Run step 6 first - there is no LAB_average file yet.")
             return
         self.save_settings()
         values = self.settings_dict()
         generated = os.path.join(project, "_generated")
-        written, problems = write_configured_r(project, values, generated)
+        written, problems = write_configured_r(project, values, generated,
+                                               self.current_profile())
         if problems:
             messagebox.showerror("Could not set up the R scripts", "\n".join(problems))
             return
@@ -1027,7 +1345,7 @@ class Application(tk.Tk):
             self._after_step = None
             colour = ProjectChecks(project).colour_state()
             if colour["colormap"] and os.path.exists(script_path(PYTHON_STEPS["colormaps"])):
-                self.run_step("Colour maps per fish",
+                self.run_step("Color maps per video",
                               [sys.executable, script_path(PYTHON_STEPS["colormaps"]),
                                "--colormap", colour["colormap"],
                                "--manifest", os.path.join(project, "frames",
