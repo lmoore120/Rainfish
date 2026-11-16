@@ -56,6 +56,76 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 SETTINGS_FILE = "rainfish.json"
 OLD_SETTINGS_FILE = "fishcolour.json"     # read if a project predates the rename
 
+# Logos (in files\assets): the window icon, the header on the main window,
+# and the picture shown while Rainfish starts up.
+ASSETS = os.path.join(HERE, "assets")
+ICON_IMAGE = os.path.join(ASSETS, "rainfish_icon.png")
+LOGO_IMAGE = os.path.join(ASSETS, "rainfish_logo.png")
+SPLASH_IMAGE = os.path.join(ASSETS, "rainfish_splash.png")
+SPLASH_MS = 2500
+BRAND_PURPLE = "#2e0b6e"
+
+
+def load_picture(path, max_width=None, max_height=None, crop=False, square=False,
+                 background=None):
+    """A PNG as a tk.PhotoImage, optionally trimmed of empty margins and
+    shrunk to fit. Uses OpenCV for the resizing (already needed for the
+    other steps), so no extra package is required. None if it can't be read."""
+    try:
+        import cv2
+        import numpy as np
+    except ImportError:
+        return None
+    image = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+    if image is None:
+        return None
+    if image.ndim == 2:
+        image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGRA)
+    elif image.shape[2] == 3:
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2BGRA)
+
+    if crop:
+        # Keep only what's drawn: opaque, and not plain white.
+        drawn = (image[:, :, 3] > 20) & (image[:, :, :3].min(axis=2) < 235)
+        ys, xs = np.nonzero(drawn)
+        if len(xs):
+            pad = max(4, int(0.02 * max(image.shape[:2])))
+            y0, y1 = max(0, ys.min() - pad), min(image.shape[0], ys.max() + pad + 1)
+            x0, x1 = max(0, xs.min() - pad), min(image.shape[1], xs.max() + pad + 1)
+            image = image[y0:y1, x0:x1]
+    if square:
+        h, w = image.shape[:2]
+        side = max(h, w)
+        canvas = np.zeros((side, side, 4), dtype=image.dtype)
+        canvas[(side - h) // 2:(side - h) // 2 + h, (side - w) // 2:(side - w) // 2 + w] = image
+        image = canvas
+
+    h, w = image.shape[:2]
+    scale = 1.0
+    if max_width:
+        scale = min(scale, max_width / w)
+    if max_height:
+        scale = min(scale, max_height / h)
+    if scale < 1.0:
+        image = cv2.resize(image, (max(1, int(w * scale)), max(1, int(h * scale))),
+                           interpolation=cv2.INTER_AREA)
+    if background is not None:
+        # Flatten onto a solid colour (Tk shows partial transparency poorly).
+        rgb = background.lstrip("#")
+        colour = np.array([int(rgb[4:6], 16), int(rgb[2:4], 16), int(rgb[0:2], 16)], float)
+        alpha = image[:, :, 3:4].astype(float) / 255.0
+        flat = image[:, :, :3] * alpha + colour * (1 - alpha)
+        image = cv2.cvtColor(flat.astype(np.uint8), cv2.COLOR_BGR2BGRA)
+    ok, png = cv2.imencode(".png", image)
+    if not ok:
+        return None
+    import base64
+    try:
+        return tk.PhotoImage(data=base64.b64encode(png.tobytes()))
+    except tk.TclError:
+        return None
+
+
 # Text size. Personal preferences like this are kept per user, not per
 # project, in a small file in the home folder.
 DEFAULT_FONT_SIZE = 12
@@ -565,6 +635,11 @@ class Application(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Rainfish")
+        # Keep the main window hidden behind the start-up picture while it's
+        # being built, then show it.
+        self.withdraw()
+        self._set_icon()
+        splash = self._show_splash()
         # As big as is comfortable on this screen, up to 1250 x 900.
         width = min(1250, self.winfo_screenwidth() - 80)
         height = min(900, self.winfo_screenheight() - 100)
@@ -596,6 +671,84 @@ class Application(tk.Tk):
         self._build()
         self.after(120, self._pump)
         self._check_tools()
+        self._finish_splash(splash)
+
+    # ------------------------------------------------------------- logos
+    def _set_icon(self):
+        """The fish as the window's corner icon (and taskbar icon)."""
+        if os.name == "nt":
+            # Without this, Windows groups the window under python.exe and
+            # shows Python's icon on the taskbar instead of Rainfish's.
+            try:
+                import ctypes
+                ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("Rainfish")
+            except Exception:                           # noqa: BLE001
+                pass
+        # Several sizes, so Windows can pick a sharp one for each place.
+        self._icons = [icon for icon in (load_picture(ICON_IMAGE, size, size, crop=True,
+                                                      square=True)
+                                         for size in (16, 32, 48, 64, 128)) if icon]
+        if self._icons:
+            self.iconphoto(True, *self._icons)
+
+    def _show_splash(self):
+        """The wide Rainfish banner in the middle of the screen at start-up.
+        Click it to skip."""
+        picture = load_picture(SPLASH_IMAGE, max_width=int(self.winfo_screenwidth() * 0.6),
+                               background="#ffffff")
+        if picture is None:
+            return None
+        splash = tk.Toplevel(self)
+        splash.overrideredirect(True)                  # no title bar
+        # A thin border in the logo's purple, so it stands out over white windows.
+        splash.configure(background="#ffffff", highlightthickness=2,
+                         highlightbackground=BRAND_PURPLE, highlightcolor=BRAND_PURPLE)
+        splash.attributes("-topmost", True)
+        label = tk.Label(splash, image=picture, background="#ffffff", borderwidth=0)
+        label.image = picture
+        label.pack(padx=30, pady=24)
+        splash.update_idletasks()
+        width, height = splash.winfo_reqwidth(), splash.winfo_reqheight()
+        x = (self.winfo_screenwidth() - width) // 2
+        y = (self.winfo_screenheight() - height) // 3
+        splash.geometry(f"{width}x{height}+{x}+{y}")
+        splash.started = time.time()
+        for widget in (splash, label):
+            widget.bind("<Button-1>", lambda e: self._close_splash(splash))
+        splash.update()
+        return splash
+
+    def _reveal(self):
+        """Show the main window, then give the tabs about three quarters of
+        the height (only possible once the window has a real size)."""
+        self.deiconify()
+        self.lift()
+        self.focus_force()
+        self.after(100, lambda: self.panes.sashpos(
+            0, int(self.panes.winfo_height() * 0.75)))
+
+    def _finish_splash(self, splash):
+        if splash is None:
+            self._reveal()
+            return
+        remaining = SPLASH_MS - int((time.time() - splash.started) * 1000)
+        self.after(max(0, remaining), lambda: self._close_splash(splash))
+
+    def _close_splash(self, splash):
+        if splash.winfo_exists():
+            splash.destroy()
+        if self.state() == "withdrawn":
+            self._reveal()
+
+    def _update_header_logo(self):
+        """The Rainfish logo across the top, sized with the text."""
+        if not hasattr(self, "header_logo"):
+            return
+        height = max(70, int(self.font_size * 7))
+        picture = load_picture(LOGO_IMAGE, max_height=height, crop=True)
+        if picture is not None:
+            self.header_logo.configure(image=picture)
+            self.header_logo.image = picture
 
     # ----------------------------------------------------------- text size
     # Tk's built-in named fonts are used by every standard widget, so
@@ -637,6 +790,7 @@ class Application(tk.Tk):
             self.font_size_label.configure(text=str(size))
         if hasattr(self, "settings_intro"):
             self._rewrap()
+        self._update_header_logo()
         if save:
             write_prefs(font_size=size)
 
@@ -692,6 +846,15 @@ class Application(tk.Tk):
 
     # ---------------------------------------------------------- layout
     def _build(self):
+        if os.path.exists(LOGO_IMAGE):
+            # A white band across the top, matching the logo's own background.
+            header = tk.Frame(self, background="#ffffff")
+            header.pack(fill="x")
+            self.header_logo = tk.Label(header, background="#ffffff", borderwidth=0)
+            self.header_logo.pack(pady=6)
+            tk.Frame(self, background=BRAND_PURPLE, height=2).pack(fill="x")
+            self._update_header_logo()
+
         top = ttk.Frame(self, padding=8)
         top.pack(fill="x")
         ttk.Label(top, text="Project folder:").pack(side="left")
@@ -731,8 +894,6 @@ class Application(tk.Tk):
         panes = ttk.PanedWindow(self, orient="vertical")
         panes.pack(fill="both", expand=True, padx=8, pady=(0, 4))
         self.panes = panes
-        # Start with about three quarters of the height for the tabs.
-        self.after(150, lambda: panes.sashpos(0, int(panes.winfo_height() * 0.75)))
         self.notebook = ttk.Notebook(panes)
         panes.add(self.notebook, weight=3)
         self._build_settings_tab()
