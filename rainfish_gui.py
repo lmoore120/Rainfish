@@ -48,12 +48,38 @@ import sys
 import threading
 import time
 import tkinter as tk
+import tkinter.font as tkfont
 from tkinter import filedialog, messagebox, ttk
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 SETTINGS_FILE = "rainfish.json"
 OLD_SETTINGS_FILE = "fishcolour.json"     # read if a project predates the rename
+
+# Text size. Personal preferences like this are kept per user, not per
+# project, in a small file in the home folder.
+DEFAULT_FONT_SIZE = 12
+MIN_FONT_SIZE, MAX_FONT_SIZE = 8, 28
+PREFS_FILE = os.path.join(os.path.expanduser("~"), ".rainfish_prefs.json")
+
+
+def read_prefs():
+    try:
+        with open(PREFS_FILE, encoding="utf-8") as handle:
+            prefs = json.load(handle)
+        return prefs if isinstance(prefs, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def write_prefs(**changes):
+    prefs = read_prefs()
+    prefs.update(changes)
+    try:
+        with open(PREFS_FILE, "w", encoding="utf-8") as handle:
+            json.dump(prefs, handle, indent=2)
+    except OSError:
+        pass                                    # not worth interrupting anyone over
 
 try:
     import fishcolour_config as config_module
@@ -497,12 +523,54 @@ def write_patch_values(project, reference_rgb, names):
 # The window
 # =====================================================================
 
+class ScrollFrame(ttk.Frame):
+    """A frame whose contents scroll vertically when they don't fit - so a
+    larger text size never pushes buttons off the bottom of a tab. Put
+    widgets in .inner."""
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        background = ttk.Style(self).lookup("TFrame", "background") or None
+        self.canvas = tk.Canvas(self, highlightthickness=0, borderwidth=0,
+                                background=background)
+        self.scrollbar = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
+        self.inner = ttk.Frame(self.canvas)
+        self._window = self.canvas.create_window((0, 0), window=self.inner, anchor="nw")
+        self.canvas.configure(yscrollcommand=self.scrollbar.set)
+        self.canvas.pack(side="left", fill="both", expand=True)
+        self.scrollbar.pack(side="right", fill="y")
+        self.inner.bind("<Configure>", self._update_region)
+        # The contents stretch to the visible width, so nothing scrolls sideways.
+        self.canvas.bind("<Configure>", lambda e: (
+            self.canvas.itemconfigure(self._window, width=e.width),
+            self._update_region()))
+        # Scroll with the wheel only while the pointer is over this tab.
+        self.bind("<Enter>", lambda e: self.bind_all("<MouseWheel>", self._on_wheel))
+        self.bind("<Leave>", lambda e: self.unbind_all("<MouseWheel>"))
+
+    def _update_region(self, _event=None):
+        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+        fits = self.inner.winfo_reqheight() <= self.canvas.winfo_height()
+        if fits:
+            self.canvas.yview_moveto(0)
+
+    def _on_wheel(self, event):
+        if event.state & 0x4:                   # Ctrl+wheel changes text size instead
+            return
+        if self.inner.winfo_reqheight() > self.canvas.winfo_height():
+            self.canvas.yview_scroll(int(-event.delta / 120) or (-1 if event.delta > 0 else 1),
+                                     "units")
+
 class Application(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Rainfish")
-        self.geometry("1100x800")
-        self.minsize(900, 650)
+        # As big as is comfortable on this screen, up to 1250 x 900.
+        width = min(1250, self.winfo_screenwidth() - 80)
+        height = min(900, self.winfo_screenheight() - 100)
+        self.geometry(f"{width}x{height}")
+        self.minsize(760, 520)
+        self._setup_fonts(read_prefs().get("font_size", DEFAULT_FONT_SIZE))
 
         self.project = tk.StringVar(value="")
         self.rscript = find_rscript()
@@ -529,6 +597,99 @@ class Application(tk.Tk):
         self.after(120, self._pump)
         self._check_tools()
 
+    # ----------------------------------------------------------- text size
+    # Tk's built-in named fonts are used by every standard widget, so
+    # resizing them resizes buttons, labels, entries, tabs and checkboxes
+    # together. The few bigger/bolder fonts used here are named fonts too,
+    # kept in proportion to the base size.
+    BUILT_IN_FONTS = ("TkDefaultFont", "TkTextFont", "TkMenuFont", "TkHeadingFont",
+                      "TkCaptionFont", "TkIconFont", "TkFixedFont")
+    SMALL_FONTS = ("TkSmallCaptionFont", "TkTooltipFont")
+
+    def _setup_fonts(self, size):
+        self.font_section = tkfont.Font(self, weight="bold")       # Settings headings
+        self.font_title = tkfont.Font(self, weight="bold")         # step names
+        self.font_symbol = tkfont.Font(self)                       # step status circles
+        self.font_log = tkfont.nametofont("TkFixedFont").copy()    # the log pane
+        # Dropdown lists don't follow the named fonts unless told to.
+        self.option_add("*TCombobox*Listbox.font", "TkTextFont")
+        self.font_size = None
+        self.set_font_size(size, save=False)
+
+    def set_font_size(self, size, save=True):
+        try:
+            size = int(size)
+        except (TypeError, ValueError):
+            size = DEFAULT_FONT_SIZE
+        size = max(MIN_FONT_SIZE, min(MAX_FONT_SIZE, size))
+        if size == self.font_size:
+            return
+        self.font_size = size
+        for name in self.BUILT_IN_FONTS:
+            tkfont.nametofont(name).configure(size=size)
+        for name in self.SMALL_FONTS:
+            tkfont.nametofont(name).configure(size=max(MIN_FONT_SIZE, size - 1))
+        self.font_section.configure(size=size)
+        self.font_title.configure(size=size + 1)
+        self.font_symbol.configure(size=size + 4)
+        self.font_log.configure(size=size)
+        if hasattr(self, "font_size_label"):
+            self.font_size_label.configure(text=str(size))
+        if hasattr(self, "settings_intro"):
+            self._rewrap()
+        if save:
+            write_prefs(font_size=size)
+
+    def change_font_size(self, step):
+        if step == 0:
+            self.set_font_size(DEFAULT_FONT_SIZE)
+        else:
+            self.set_font_size(self.font_size + step)
+
+    def _bind_font_keys(self):
+        for sequence in ("<Control-plus>", "<Control-equal>", "<Control-KP_Add>"):
+            self.bind_all(sequence, lambda e: self.change_font_size(+1))
+        for sequence in ("<Control-minus>", "<Control-underscore>", "<Control-KP_Subtract>"):
+            self.bind_all(sequence, lambda e: self.change_font_size(-1))
+        for sequence in ("<Control-0>", "<Control-KP_0>"):
+            self.bind_all(sequence, lambda e: self.change_font_size(0))
+        self.bind_all("<Control-MouseWheel>",
+                      lambda e: self.change_font_size(+1 if e.delta > 0 else -1))
+
+    def _rewrap(self, _event=None):
+        """Long explanatory text wraps to the space actually available, so
+        nothing runs off the right-hand edge at a large text size. Done after
+        the layout settles, since it depends on where each label ended up."""
+        if getattr(self, "_rewrap_pending", False):
+            return
+        self._rewrap_pending = True
+
+        def apply(passes_left=4):
+            # Re-wrapping moves things (columns narrow or widen), which can
+            # change the space available, so repeat until nothing changes.
+            self.update_idletasks()
+            changed = False
+            intro = max(300, self.winfo_width() - 80)
+            if int(self.settings_intro.cget("wraplength") or 0) != intro:
+                self.settings_intro.configure(wraplength=intro)
+                changed = True
+            for label, container, *beside in getattr(self, "wrap_labels", []):
+                if not label.winfo_ismapped():
+                    continue
+                right_edge = container.winfo_rootx() + container.winfo_width()
+                if beside:                      # leave room for e.g. the step's button
+                    right_edge -= beside[0].winfo_width() + 12
+                wrap = max(120, right_edge - label.winfo_rootx() - 24)
+                if abs(int(label.cget("wraplength") or 0) - wrap) > 4:
+                    label.configure(wraplength=wrap)
+                    changed = True
+            if changed and passes_left > 1:
+                self.after(30, lambda: apply(passes_left - 1))
+            else:
+                self._rewrap_pending = False
+
+        self.after_idle(apply)
+
     # ---------------------------------------------------------- layout
     def _build(self):
         top = ttk.Frame(self, padding=8)
@@ -539,13 +700,25 @@ class Application(tk.Tk):
         ttk.Button(top, text="Choose...", command=self.choose_project).pack(side="left")
         ttk.Button(top, text="New...", command=self.new_project).pack(side="left", padx=4)
 
-        self.notebook = ttk.Notebook(self)
-        self.notebook.pack(fill="both", expand=True, padx=8)
-        self._build_settings_tab()
-        self._build_steps_tab()
+        # Text size: A- / A+ here, or Ctrl + / Ctrl - / Ctrl 0, or Ctrl+wheel.
+        # Packed on the right before anything else claims the space, so it
+        # can't be squeezed off the edge at a large size.
+        sizer = ttk.Frame(top)
+        sizer.pack(side="right", padx=(16, 0), before=top.winfo_children()[0])
+        ttk.Label(sizer, text="Text size:").pack(side="left")
+        ttk.Button(sizer, text="A−", width=3,
+                   command=lambda: self.change_font_size(-1)).pack(side="left", padx=(4, 0))
+        self.font_size_label = ttk.Label(sizer, text=str(self.font_size), width=3,
+                                         anchor="center")
+        self.font_size_label.pack(side="left")
+        ttk.Button(sizer, text="A+", width=3,
+                   command=lambda: self.change_font_size(+1)).pack(side="left")
+        self._bind_font_keys()
 
+        # Status bar at the very bottom, so it stays visible however the
+        # space above is divided.
         bar = ttk.Frame(self, padding=(8, 4))
-        bar.pack(fill="x")
+        bar.pack(side="bottom", fill="x")
         self.status = ttk.Label(bar, text="Choose a project folder to begin.")
         self.status.pack(side="left")
         self.progress = ttk.Progressbar(bar, mode="determinate", length=260)
@@ -554,10 +727,23 @@ class Application(tk.Tk):
                                       state="disabled")
         self.stop_button.pack(side="right", padx=8)
 
-        log_frame = ttk.LabelFrame(self, text="What is happening", padding=4)
-        log_frame.pack(fill="both", expand=True, padx=8, pady=(0, 8))
-        self.log = tk.Text(log_frame, height=14, wrap="word", bg="#1e1e1e",
-                           fg="#dcdcdc", insertbackground="#dcdcdc")
+        # Tabs above, log below, with a divider that can be dragged.
+        panes = ttk.PanedWindow(self, orient="vertical")
+        panes.pack(fill="both", expand=True, padx=8, pady=(0, 4))
+        self.panes = panes
+        # Start with about three quarters of the height for the tabs.
+        self.after(150, lambda: panes.sashpos(0, int(panes.winfo_height() * 0.75)))
+        self.notebook = ttk.Notebook(panes)
+        panes.add(self.notebook, weight=3)
+        self._build_settings_tab()
+        self._build_steps_tab()
+        self.notebook.bind("<<NotebookTabChanged>>", self._rewrap)
+
+        log_frame = ttk.LabelFrame(panes, text="What is happening  (drag the "
+                                               "divider above to resize)", padding=4)
+        panes.add(log_frame, weight=1)
+        self.log = tk.Text(log_frame, height=8, wrap="word", bg="#1e1e1e",
+                           fg="#dcdcdc", insertbackground="#dcdcdc", font=self.font_log)
         scroll = ttk.Scrollbar(log_frame, command=self.log.yview)
         self.log.configure(yscrollcommand=scroll.set)
         scroll.pack(side="right", fill="y")
@@ -567,13 +753,18 @@ class Application(tk.Tk):
         self.log.tag_configure("note", foreground="#f0c674")
 
     def _build_settings_tab(self):
-        tab = ttk.Frame(self.notebook, padding=12)
-        self.notebook.add(tab, text="Settings")
+        scroller = ScrollFrame(self.notebook)
+        self.notebook.add(scroller, text="Settings")
+        tab = ttk.Frame(scroller.inner, padding=12)
+        tab.pack(fill="both", expand=True)
+        self.wrap_labels = []                   # (label, container it must fit in)
 
-        ttk.Label(tab, text="These describe your equipment and your animal. "
-                            f"They are saved in the project as {SETTINGS_FILE}.",
-                  wraplength=900).grid(row=0, column=0, columnspan=4, sticky="w",
-                                       pady=(0, 10))
+        self.settings_intro = ttk.Label(
+            tab, text="These describe your equipment and your animal. "
+                      f"They are saved in the project as {SETTINGS_FILE}.")
+        self.settings_intro.grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 10))
+        self.bind("<Configure>", lambda e: self._rewrap() if e.widget is self else None,
+                  add="+")
 
         fields = [
             ("Sampling", None, None, None),
@@ -598,7 +789,7 @@ class Application(tk.Tk):
                 ttk.Separator(tab, orient="horizontal").grid(
                     row=row, column=0, columnspan=4, sticky="ew", pady=(12, 4))
                 row += 1
-                ttk.Label(tab, text=label, font=("", 10, "bold")).grid(
+                ttk.Label(tab, text=label, font=self.font_section).grid(
                     row=row, column=0, sticky="w")
                 row += 1
                 continue
@@ -606,8 +797,9 @@ class Application(tk.Tk):
             variable = tk.StringVar(value=default)
             ttk.Entry(tab, textvariable=variable, width=14).grid(
                 row=row, column=1, sticky="w", padx=6)
-            ttk.Label(tab, text=hint, foreground="#666").grid(
-                row=row, column=2, sticky="w")
+            hint_label = ttk.Label(tab, text=hint, foreground="#666")
+            hint_label.grid(row=row, column=2, sticky="w")
+            self.wrap_labels.append((hint_label, tab))
             self.settings_widgets[key] = variable
             row += 1
 
@@ -623,8 +815,10 @@ class Application(tk.Tk):
         tab.columnconfigure(2, weight=1)
 
     def _build_steps_tab(self):
-        tab = ttk.Frame(self.notebook, padding=12)
-        self.notebook.add(tab, text="Steps")
+        scroller = ScrollFrame(self.notebook)
+        self.notebook.add(scroller, text="Steps")
+        tab = ttk.Frame(scroller.inner, padding=12)
+        tab.pack(fill="both", expand=True)
         self.step_rows = {}
 
         steps = [
@@ -657,17 +851,19 @@ class Application(tk.Tk):
             tab.columnconfigure(0, weight=1)
             frame.columnconfigure(1, weight=1)
 
-            state = ttk.Label(frame, text="\u25cb", width=3, font=("", 14))
+            state = ttk.Label(frame, text="\u25cb", width=3, font=self.font_symbol)
             state.grid(row=0, column=0, rowspan=2)
-            ttk.Label(frame, text=title, font=("", 11, "bold")).grid(
+            ttk.Label(frame, text=title, font=self.font_title).grid(
                 row=0, column=1, sticky="w")
-            ttk.Label(frame, text=description, foreground="#666").grid(
-                row=1, column=1, sticky="w")
+            description_label = ttk.Label(frame, text=description, foreground="#666")
+            description_label.grid(row=1, column=1, sticky="w")
             button = ttk.Button(frame, text=verb, width=10,
                                 command=command)
             button.grid(row=0, column=2, rowspan=2, padx=6)
+            self.wrap_labels.append((description_label, frame, button))
             detail = ttk.Label(frame, text="", foreground="#444")
             detail.grid(row=2, column=1, columnspan=2, sticky="w")
+            self.wrap_labels.append((detail, frame))
             self.step_rows[key] = {"state": state, "button": button, "detail": detail}
 
             if key == "extract":
@@ -680,9 +876,12 @@ class Application(tk.Tk):
                 self.extra_frame_entry = ttk.Entry(
                     options, textvariable=self.extra_frame_seconds, width=7)
                 self.extra_frame_entry.pack(side="left", padx=4)
-                ttk.Label(options, text="seconds  (outside the even series - e.g. the "
-                                        "end of a trial, for capacity)",
-                          foreground="#666").pack(side="left")
+                ttk.Label(options, text="seconds").pack(side="left")
+                explain = ttk.Label(options, text="(outside the even series - e.g. the "
+                                                  "end of a trial, for capacity)",
+                                    foreground="#666", justify="left")
+                explain.pack(side="left", padx=(8, 0))
+                self.wrap_labels.append((explain, tab))
                 self._extra_frame_toggled()
 
             if key == "landmark":
