@@ -59,10 +59,14 @@ OLD_SETTINGS_FILE = "fishcolour.json"     # read if a project predates the renam
 # Logos (in files\assets): the window icon, the header on the main window,
 # and the picture shown while Rainfish starts up.
 ASSETS = os.path.join(HERE, "assets")
-ICON_IMAGE = os.path.join(ASSETS, "rainfish_icon.png")
+ICON_IMAGE = os.path.join(ASSETS, "rainfish_icon.png")    # the R.f. monogram
+ICON_FILE = os.path.join(ASSETS, "rainfish.ico")          # same, as a Windows icon (make_icon.py)
 LOGO_IMAGE = os.path.join(ASSETS, "rainfish_logo.png")
 SPLASH_IMAGE = os.path.join(ASSETS, "rainfish_splash.png")
 SPLASH_MS = 2500
+
+# plasticity_rates.R's min_frames: a video needs this many frames to fit a rate.
+MIN_FRAMES_FOR_RATES = 4
 BRAND_PURPLE = "#2e0b6e"
 
 
@@ -496,6 +500,19 @@ def forward(path):
     return os.path.abspath(path).replace("\\", "/")
 
 
+def find_lab_average(project, background):
+    """The LAB_average_<background>.csv the CIE step wrote, falling back to
+    the newest LAB_average_*.csv there is. Returns the expected path even if
+    nothing exists yet (the CIE step runs before the rates step reads it)."""
+    folder = os.path.join(project, "colormaps")
+    expected = os.path.join(folder, f"LAB_average_{background}.csv")
+    if os.path.exists(expected) or not os.path.isdir(folder):
+        return expected
+    found = [os.path.join(folder, f) for f in os.listdir(folder)
+             if f.startswith("LAB_average_") and f.endswith(".csv")]
+    return max(found, key=os.path.getmtime) if found else expected
+
+
 def write_configured_r(project, settings, generated_folder, profile=None):
     """Copy each R script with its paths and settings filled in.
 
@@ -512,10 +529,12 @@ def write_configured_r(project, settings, generated_folder, profile=None):
             return
         with open(source, encoding="utf-8") as handle:
             text = handle.read()
-        for pattern, replacement, *extra_flags in replacements:
+        # Each entry: (pattern, replacement[, extra regex flags[, how many]]).
+        # "How many" is 1 unless given; 0 replaces every matching line.
+        for pattern, replacement, *extra in replacements:
             new_text, count = re.subn(pattern, replacement.replace("\\", "\\\\"),
-                                      text, count=1,
-                                      flags=re.M | (extra_flags[0] if extra_flags else 0))
+                                      text, count=extra[1] if len(extra) > 1 else 1,
+                                      flags=re.M | (extra[0] if extra else 0))
             if count == 0:
                 problems.append(f"{name}: could not find the line matching "
                                 f"{pattern!r} to set. The script may have been edited.")
@@ -525,6 +544,7 @@ def write_configured_r(project, settings, generated_folder, profile=None):
             handle.write(text)
         done.append(target)
 
+    background = settings.get("background") or "white"
     frames = forward(os.path.join(project, "frames")) + "/"
     landmarks = forward(os.path.join(project, "landmarks"))
     colormaps = forward(os.path.join(project, "colormaps")) + "/"
@@ -562,12 +582,20 @@ def write_configured_r(project, settings, generated_folder, profile=None):
          f'colormap_file <- "{colormaps}colormap_calib.csv"'),
         (r'^manifest_file\s*<-.*$', f'manifest_file <- "{manifest}"'),
         (r'^output_dir\s*<-.*$', f'output_dir <- "{colormaps}"'),
+        # The background (white/black) from Settings. The CIE script prefers
+        # one recorded in the manifest, which only exists if the videos were
+        # in a folder named white or black; otherwise it used to fall back to
+        # "unknown" and write LAB_average_unknown.csv, which the rates step
+        # then couldn't find. (The line appears twice in the script.)
+        (r'^background\s*<-.*$', f'background <- "{background}"', 0, 0),
     ])
 
-    background = settings.get("background") or "white"
+    # The rates step reads whichever LAB_average file the CIE step actually
+    # wrote: the one for this background if it's there, otherwise the only
+    # one there is (e.g. LAB_average_unknown.csv from an earlier run).
     configure(R_STEPS["rates"], [
         (r'^lab_file\s*<-.*$',
-         f'lab_file <- "{colormaps}LAB_average_{background}.csv"'),
+         f'lab_file <- "{forward(find_lab_average(project, background))}"'),
         (r'^manifest_file\s*<-.*$', f'manifest_file <- "{manifest}"'),
         (r'^landmarks_csv\s*<-.*$', f'landmarks_csv <- "{landmarks}/landmarks.csv"'),
         (r'^output_dir\s*<-.*$', f'output_dir <- "{results}"'),
@@ -684,10 +712,18 @@ class Application(tk.Tk):
                 ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("Rainfish")
             except Exception:                           # noqa: BLE001
                 pass
-        # Several sizes, so Windows can pick a sharp one for each place.
-        self._icons = [icon for icon in (load_picture(ICON_IMAGE, size, size, crop=True,
-                                                      square=True)
-                                         for size in (16, 32, 48, 64, 128)) if icon]
+        self._icons = []
+        if os.name == "nt" and os.path.exists(ICON_FILE):
+            # The .ico holds every size Windows picks from for the title bar
+            # and taskbar.
+            try:
+                self.iconbitmap(default=ICON_FILE)
+                return
+            except tk.TclError:
+                pass
+        # Elsewhere (or if the .ico is missing): the icon PNG, as it is.
+        self._icons = [icon for icon in (load_picture(ICON_IMAGE, size, size, square=True)
+                                         for size in (32, 64, 128)) if icon]
         if self._icons:
             self.iconphoto(True, *self._icons)
 
@@ -930,7 +966,8 @@ class Application(tk.Tk):
         fields = [
             ("Sampling", None, None, None),
             ("Frames per video", "frames_per_video", "10",
-             "evenly spaced across the window below"),
+             f"evenly spaced across the window below; at least "
+             f"{MIN_FRAMES_FOR_RATES} to fit rates"),
             ("Window (seconds)", "window_seconds", "120",
              "the stretch those frames are spread across"),
             ("Equipment", None, None, None),
@@ -1471,8 +1508,18 @@ class Application(tk.Tk):
             messagebox.showwarning("No videos", "Put videos in the project's videos "
                                                 "folder first (step 1).")
             return
-        self.save_settings()
         values = self.settings_dict()
+        try:
+            per_video = int(values.get("frames_per_video", 10))
+        except (TypeError, ValueError):
+            per_video = 0
+        if per_video < MIN_FRAMES_FOR_RATES and not messagebox.askyesno(
+                "Few frames per video",
+                f"Frames per video is {per_video}. The rates step (7) needs at least "
+                f"{MIN_FRAMES_FOR_RATES} usable frames per video to fit a trend, so "
+                f"step 7 won't be able to run on these.\n\nExtract anyway?"):
+            return
+        self.save_settings()
         project = self.project.get()
         command = [sys.executable, script_path(PYTHON_STEPS["extract"]),
                    os.path.join(project, "videos"),
@@ -1679,6 +1726,28 @@ class Application(tk.Tk):
             messagebox.showwarning("No color data",
                                    "Run step 6 first - there is no LAB_average file yet.")
             return
+
+        # The rates script needs MIN_FRAMES_FOR_RATES frames from a video to
+        # fit anything. Say so plainly here rather than let R stop with an error.
+        counts = {}
+        for row in read_csv_rows(os.path.join(project, "frames", "frames_manifest.csv")):
+            if str(row.get("capacity_frame", "0")) != "1":
+                counts[row.get("video", "")] = counts.get(row.get("video", ""), 0) + 1
+        enough = [v for v, n in counts.items() if n >= MIN_FRAMES_FOR_RATES]
+        if counts and not enough:
+            most = max(counts.values())
+            messagebox.showwarning(
+                "Not enough frames per video",
+                f"Every video has fewer than {MIN_FRAMES_FOR_RATES} frames (the most "
+                f"is {most}), and the rates step needs at least "
+                f"{MIN_FRAMES_FOR_RATES} per video to fit a trend.\n\n"
+                f"Set 'Frames per video' in Settings to {MIN_FRAMES_FOR_RATES} or more "
+                f"(10 is the usual), then run steps 2, 4 and 6 again.")
+            return
+        if counts and len(enough) < len(counts):
+            self.append_log(f"Note: {len(counts) - len(enough)} video(s) have fewer than "
+                            f"{MIN_FRAMES_FOR_RATES} frames and will be left out of the "
+                            f"rates.\n", "note")
         self.save_settings()
         values = self.settings_dict()
         generated = os.path.join(project, "_generated")
